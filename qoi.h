@@ -249,7 +249,23 @@ typedef struct {
 	unsigned int size;
 } qoi_header_t;
 
-const static qoi_magic_t qoi_magic = {.chars = {'q','o','i','f'}};
+const static qoi_magic_t qoi_magic = {.chars = {'q','o','i','R'}};
+
+#define QOI_PROBS_SIZE 0x300
+#define QOI_PROBS_INIT 1024
+
+typedef struct {
+	unsigned long int low;
+	unsigned int range;
+	unsigned char cache;
+	unsigned long int cache_size;
+	unsigned short probs[QOI_PROBS_SIZE];
+	unsigned char* bytes;
+} qoi_range_encoder_t;
+
+void qoi_range_encoder_init(qoi_range_encoder_t* enc, unsigned char* bytes);
+void qoi_range_encoder_write(qoi_range_encoder_t* enc, unsigned char byte);
+void qoi_range_encoder_flush(qoi_range_encoder_t* enc);
 
 void *qoi_encode(const void *data, int w, int h, int channels, int *out_len) {
 	if (
@@ -262,7 +278,6 @@ void *qoi_encode(const void *data, int w, int h, int channels, int *out_len) {
 	}
 
 	int max_size = w * h * (channels + 1) + sizeof(qoi_header_t) + 4;
-	int p = 0;
 	unsigned char *bytes = QOI_MALLOC(max_size);
 	if (!bytes) {
 		return NULL;
@@ -274,7 +289,9 @@ void *qoi_encode(const void *data, int w, int h, int channels, int *out_len) {
 		.height = h,
 		.size = 0 // will be set at the end
 	};
-	p += sizeof(qoi_header_t);
+
+	qoi_range_encoder_t renc;
+	qoi_range_encoder_init(&renc, bytes+sizeof(qoi_header_t));
 
 	const unsigned char *pixels = (const unsigned char *)data;
 
@@ -303,12 +320,12 @@ void *qoi_encode(const void *data, int w, int h, int channels, int *out_len) {
 		if (run > 0 && (run == 0x2020 || px.v != px_prev.v || px_pos == px_end)) {
 			if (run < 33) {
 				run -= 1;
-				bytes[p++] = QOI_RUN_8 | run;
+				qoi_range_encoder_write(&renc, QOI_RUN_8 | run);
 			}
 			else {
 				run -= 33;
-				bytes[p++] = QOI_RUN_16 | run >> 8;
-				bytes[p++] = run;
+				qoi_range_encoder_write(&renc, QOI_RUN_16 | run >> 8);
+				qoi_range_encoder_write(&renc, run);
 			}
 			run = 0;
 		}
@@ -317,7 +334,7 @@ void *qoi_encode(const void *data, int w, int h, int channels, int *out_len) {
 			int index_pos = QOI_COLOR_HASH(px) % 64;
 
 			if (index[index_pos].v == px.v) {
-				bytes[p++] = QOI_INDEX | index_pos;
+				qoi_range_encoder_write(&renc, QOI_INDEX | index_pos);
 			}
 			else {
 				index[index_pos] = px;
@@ -335,37 +352,36 @@ void *qoi_encode(const void *data, int w, int h, int channels, int *out_len) {
 						va == 0 && vr > -2 && vr < 3 &&
 						vg > -2 && vg < 3 && vb > -2 && vb < 3
 					) {
-						bytes[p++] = QOI_DIFF_8 | ((vr + 1) << 4) | (vg + 1) << 2 | (vb + 1);
+						qoi_range_encoder_write(&renc, QOI_DIFF_8 | ((vr + 1) << 4) | (vg + 1) << 2 | (vb + 1));
 					}
 					else if (
 						va == 0 && vr > -16 && vr < 17 && 
 						vg > -8 && vg < 9 && vb > -8 && vb < 9
 					) {
-						bytes[p++] = QOI_DIFF_16 | (vr + 15);
-						bytes[p++] = ((vg + 7) << 4) | (vb + 7);
+						qoi_range_encoder_write(&renc, QOI_DIFF_16 | (vr + 15));
+						qoi_range_encoder_write(&renc, ((vg + 7) << 4) | (vb + 7));
 					}
 					else {
-						bytes[p++] = QOI_DIFF_24 | ((vr + 15) >> 1);
-						bytes[p++] = ((vr + 15) << 7) | ((vg + 15) << 2) | ((vb + 15) >> 3);
-						bytes[p++] = ((vb + 15) << 5) | (va + 15);
+						qoi_range_encoder_write(&renc, QOI_DIFF_24 | ((vr + 15) >> 1));
+						qoi_range_encoder_write(&renc, ((vr + 15) << 7) | ((vg + 15) << 2) | ((vb + 15) >> 3));
+						qoi_range_encoder_write(&renc, ((vb + 15) << 5) | (va + 15));
 					}
 				}
 				else {
-					bytes[p++] = QOI_COLOR | (vr?8:0)|(vg?4:0)|(vb?2:0)|(va?1:0);
-					if (vr) { bytes[p++] = px.rgba.r; }
-					if (vg) { bytes[p++] = px.rgba.g; }
-					if (vb) { bytes[p++] = px.rgba.b; }
-					if (va) { bytes[p++] = px.rgba.a; }
+					qoi_range_encoder_write(&renc, QOI_COLOR | (vr?8:0)|(vg?4:0)|(vb?2:0)|(va?1:0));
+					if (vr) { qoi_range_encoder_write(&renc, px.rgba.r); }
+					if (vg) { qoi_range_encoder_write(&renc, px.rgba.g); }
+					if (vb) { qoi_range_encoder_write(&renc, px.rgba.b); }
+					if (va) { qoi_range_encoder_write(&renc, px.rgba.a); }
 				}
 			}
 		}
 		px_prev = px;
 	}
 
-	for (int i = 0; i < 4; i++) {
-		bytes[p++] = 0;
-	}
+	qoi_range_encoder_flush(&renc);
 
+	int p = renc.bytes - bytes;
 	((qoi_header_t *)bytes)->size = p - sizeof(qoi_header_t);
 	*out_len = p;
 	return bytes;
@@ -458,6 +474,73 @@ void *qoi_decode(const void *data, int size, int *out_w, int *out_h, int channel
 	*out_w = header->width;
 	*out_h = header->height;
 	return pixels;
+}
+
+void qoi_range_encoder_init(qoi_range_encoder_t* enc, unsigned char* bytes) {
+	enc->bytes = bytes;
+	enc->low = 0;
+	enc->range = 0xFFFFFFFF;
+	enc->cache = 0;
+	enc->cache_size = 1;
+	for (int i = 0; i < QOI_PROBS_SIZE; i++) {
+		enc->probs[i] = QOI_PROBS_INIT;
+	}
+}
+
+#define QOI_TOP_MASK 0xFF000000
+
+void qoi_range_encoder_shift_low(qoi_range_encoder_t* enc) {
+	unsigned int high_bytes = enc->low >> 32;
+	unsigned int low_bytes = enc->low & 0xFFFFFFFF;
+	if (low_bytes < QOI_TOP_MASK || high_bytes != 0) {
+		unsigned char temp = enc->cache;
+		do {
+			unsigned char out_byte = temp + (high_bytes & 0xFF);
+			*(enc->bytes++) = out_byte;
+			temp = 0xFF;
+		} while (--enc->cache_size != 0);
+		enc->cache = (enc->low >> 24) & 0xFF;
+	}
+	enc->cache_size++;
+	enc->low = low_bytes << 8;
+}
+
+void qoi_range_encoder_encode_bit(qoi_range_encoder_t* enc, int bit, unsigned short* prob)
+{
+	unsigned int new_bound = (enc->range >> 11) * (*prob);
+	if (bit) {
+		enc->low += new_bound;
+		enc->range -= new_bound;
+	} else {
+		enc->range = new_bound;
+	}
+	while ((enc->range & QOI_TOP_MASK) == 0) {
+		enc->range <<= 8;
+		qoi_range_encoder_shift_low(enc);
+	}
+
+	if (bit) {
+		*prob -= *prob >> 5;
+	} else {
+		*prob += (2048 - *prob) >> 5;
+	}
+}
+
+void qoi_range_encoder_write(qoi_range_encoder_t* enc, unsigned char byte) {
+	unsigned int m = 1;
+	for (unsigned bit_index = 8; bit_index != 0;)
+	{
+		bit_index--;
+		int bit = (byte >> bit_index) & 1;
+		qoi_range_encoder_encode_bit(enc, bit, &enc->probs[m]);
+		m = (m << 1) | bit;
+	}
+}
+
+void qoi_range_encoder_flush(qoi_range_encoder_t* enc) {
+	for (int i = 0; i < 5; i++) {
+		qoi_range_encoder_shift_low(enc);
+	}
 }
 
 #ifndef QOI_NO_STDIO
